@@ -1,7 +1,11 @@
+import os
 import torch
 import triton
 import triton.language as tl
 from torch.utils.cpp_extension import load_inline
+
+# remove warning on arch not set
+os.environ['TORCH_CUDA_ARCH_LIST'] = '8.6'
 
 # https://github.com/triton-lang/triton/issues/5388
 DEVICE = torch.device("cuda:0")
@@ -31,7 +35,9 @@ def triton_add(x : torch.Tensor,
   assert x.device == DEVICE and y.device == DEVICE and output.device == DEVICE
   n_elements = output.numel()
   grid = lambda meta : (triton.cdiv(n_elements, meta['BLOCK_SIZE']),)
-  triton_add_kernel[grid](x, y, output, n_elements, BLOCK_SIZE=1024)
+  compiled_kernel = triton_add_kernel[grid](x, y, output, n_elements, BLOCK_SIZE=1024)
+  # print(compiled_kernel.asm.keys())
+  # print(compiled_kernel.asm["ptx"])
   return output
 
 cuda_source = """
@@ -59,6 +65,16 @@ __global__ void cuda_add_packed_kernel(T* x_ptr, T* y_ptr, T* output_ptr, int n_
   }
 }
 
+template <typename T>
+__global__ void cuda_add_coarsened_kernel(T* x_ptr, T* y_ptr, T* output_ptr, int n_elements, int BLOCK_SIZE, int factor) {
+  int idx = (blockIdx.x * blockDim.x + threadIdx.x) * factor;
+  if (idx + factor * BLOCK_SIZE < n_elements) {
+    for(int i= 0; i < factor * BLOCK_SIZE; i += BLOCK_SIZE) {
+      output_ptr[idx + i] = x_ptr[idx+i] + y_ptr[idx + i];
+    }
+  }
+}
+
 torch::Tensor cuda_add_naive(torch::Tensor x, torch::Tensor y) {
   const int BLOCK_SIZE = 1024;
   torch::Tensor output = torch::zeros_like(x);
@@ -76,33 +92,56 @@ torch::Tensor cuda_add_packed(torch::Tensor x, torch::Tensor y) {
   cuda_add_packed_kernel<float><<<grid_size, BLOCK_SIZE>>>(x.data_ptr<float>(), y.data_ptr<float>(), output.data_ptr<float>(), n_elements);
   return output;
 }
+
+torch::Tensor cuda_add_coarsened(torch::Tensor x, torch::Tensor y) {
+  const int BLOCK_SIZE = 1024;
+  torch::Tensor output = torch::zeros_like(x);
+  int n_elements = x.numel();
+  int factor = 8;
+  int grid_size = (n_elements + BLOCK_SIZE * factor -1) / BLOCK_SIZE / factor;
+  cuda_add_coarsened_kernel<float><<<grid_size, BLOCK_SIZE>>>(x.data_ptr<float>(), y.data_ptr<float>(), output.data_ptr<float>(), n_elements, BLOCK_SIZE, factor);
+  return output;
+}
 """
 
 cpp_source = """
 torch::Tensor cuda_add_naive(torch::Tensor x, torch::Tensor y);
 torch::Tensor cuda_add_packed(torch::Tensor x, torch::Tensor y);
+torch::Tensor cuda_add_coarsened(torch::Tensor x, torch::Tensor y);
 """
-module = torch.utils.cpp_extension.load_inline(
+module_inline = torch.utils.cpp_extension.load_inline(
              name="cuda_add",
             cpp_sources=cpp_source,
             cuda_sources=cuda_source,
-            functions=["cuda_add_naive", "cuda_add_packed"],
-            # verbose=True,
+            functions=["cuda_add_naive", "cuda_add_packed", 'cuda_add_coarsened'],
+            verbose=True,
+        )
+module_load = torch.utils.cpp_extension.load(
+            name="cuda_add",
+            sources= [ '01.vector_add.cu'],
+            verbose=True,
+            with_cuda = True,
+            extra_cuda_cflags=["-O2"],
         )
 def cuda_add_naive(x : torch.Tensor,
              y : torch.Tensor):
-  return module.cuda_add_naive(x, y)
+  return module_load.cuda_add_naive(x, y)
 def cuda_add_packed(x, y):
-  return module.cuda_add_packed(x, y)
+  return module_load.cuda_add_packed(x, y)
+  # return module.cuda_add_coarsened(x, y)
 
 def check():
   torch.manual_seed(0)
   size = 98432
   x = torch.rand(size, device = DEVICE)
   y = torch.rand(size, device = DEVICE)
+  output_coarsened = cuda_add_naive(x, y)
+  # output_triton = triton_add(x, y)
+  # return
   output_torch = torch_add(x, y)
   output_triton = triton_add(x, y)
   output_cuda = cuda_add_naive(x, y)
+
   print(output_torch)
   print(output_triton)
   print(output_cuda)
@@ -115,7 +154,7 @@ check()
 @triton.testing.perf_report(
   triton.testing.Benchmark(
     x_names = ['size'],
-    x_vals = [2**i for i in range(12, 28, 1)],
+    x_vals = [2**i for i in range(12, 28, 2)],
     x_log = True,
     line_arg = 'provider',
     line_vals = ['triton', 'torch', 'cuda_naive', 'cuda_packed'],
