@@ -109,6 +109,8 @@ torch::Tensor cuda_add_naive(torch::Tensor x, torch::Tensor y);
 torch::Tensor cuda_add_packed(torch::Tensor x, torch::Tensor y);
 torch::Tensor cuda_add_coarsened(torch::Tensor x, torch::Tensor y);
 """
+
+# https://github.com/pytorch/pytorch/blob/8bece886552e58b75a066226c1c7da7975d68ba6/test/test_cpp_extensions_jit.py#L401
 module_inline = torch.utils.cpp_extension.load_inline(
              name="cuda_add",
             cpp_sources=cpp_source,

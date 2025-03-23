@@ -40,6 +40,7 @@ def triton_add(x : torch.Tensor,
   # print(compiled_kernel.asm["ptx"])
   return output
 
+# https://github.com/pytorch/pytorch/blob/8bece886552e58b75a066226c1c7da7975d68ba6/test/test_cpp_extensions_jit.py#L293
 module_load = torch.utils.cpp_extension.load(
             name="cuda_add",
             sources= [ '01.vector-add.cu'],
