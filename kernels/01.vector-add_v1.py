@@ -40,20 +40,90 @@ def triton_add(x : torch.Tensor,
   # print(compiled_kernel.asm["ptx"])
   return output
 
-module_load = torch.utils.cpp_extension.load(
-            name="cuda_add",
-            sources= [ '01.vector-add.cu'],
+cuda_source = """
+template <typename T>
+__global__ void cuda_add_kernel(T* x_ptr, T* y_ptr, T* output_ptr, int n_elements) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < n_elements) {
+    output_ptr[idx] = x_ptr[idx] + y_ptr[idx];
+  }
+}
+
+#define FETCH_FLOAT4(pointer) (reinterpret_cast<float4*>(&(pointer))[0])
+template <typename T>
+__global__ void cuda_add_packed_kernel(T* x_ptr, T* y_ptr, T* output_ptr, int n_elements) {
+  int idx = (blockIdx.x * blockDim.x + threadIdx.x) * 4;
+  if (idx < n_elements) {
+    float4 x4 = FETCH_FLOAT4(x_ptr[idx]);
+    float4 y4 = FETCH_FLOAT4(y_ptr[idx]);
+    float4 output4;
+    output4.x = x4.x + y4.x;
+    output4.y = x4.y + y4.y;
+    output4.z = x4.z + y4.z;
+    output4.w = x4.w + y4.w;
+    FETCH_FLOAT4(output_ptr[idx]) = output4;
+  }
+}
+
+template <typename T>
+__global__ void cuda_add_coarsened_kernel(T* x_ptr, T* y_ptr, T* output_ptr, int n_elements, int BLOCK_SIZE, int factor) {
+  int idx = (blockIdx.x * blockDim.x + threadIdx.x) * factor;
+  if (idx + factor * BLOCK_SIZE < n_elements) {
+    for(int i= 0; i < factor * BLOCK_SIZE; i += BLOCK_SIZE) {
+      output_ptr[idx + i] = x_ptr[idx+i] + y_ptr[idx + i];
+    }
+  }
+}
+
+torch::Tensor cuda_add_naive(torch::Tensor x, torch::Tensor y) {
+  const int BLOCK_SIZE = 1024;
+  torch::Tensor output = torch::zeros_like(x);
+  int n_elements = x.numel();
+  int grid_size = (n_elements + BLOCK_SIZE -1) / BLOCK_SIZE;
+  cuda_add_kernel<float><<<grid_size, BLOCK_SIZE>>>(x.data_ptr<float>(), y.data_ptr<float>(), output.data_ptr<float>(), n_elements);
+  return output;
+}
+
+torch::Tensor cuda_add_packed(torch::Tensor x, torch::Tensor y) {
+  const int BLOCK_SIZE = 1024;
+  torch::Tensor output = torch::zeros_like(x);
+  int n_elements = x.numel();
+  int grid_size = (n_elements + BLOCK_SIZE * 4 -1) / BLOCK_SIZE / 4;
+  cuda_add_packed_kernel<float><<<grid_size, BLOCK_SIZE>>>(x.data_ptr<float>(), y.data_ptr<float>(), output.data_ptr<float>(), n_elements);
+  return output;
+}
+
+torch::Tensor cuda_add_coarsened(torch::Tensor x, torch::Tensor y) {
+  const int BLOCK_SIZE = 1024;
+  torch::Tensor output = torch::zeros_like(x);
+  int n_elements = x.numel();
+  int factor = 8;
+  int grid_size = (n_elements + BLOCK_SIZE * factor -1) / BLOCK_SIZE / factor;
+  cuda_add_coarsened_kernel<float><<<grid_size, BLOCK_SIZE>>>(x.data_ptr<float>(), y.data_ptr<float>(), output.data_ptr<float>(), n_elements, BLOCK_SIZE, factor);
+  return output;
+}
+"""
+
+cpp_source = """
+torch::Tensor cuda_add_naive(torch::Tensor x, torch::Tensor y);
+torch::Tensor cuda_add_packed(torch::Tensor x, torch::Tensor y);
+torch::Tensor cuda_add_coarsened(torch::Tensor x, torch::Tensor y);
+"""
+module_inline = torch.utils.cpp_extension.load_inline(
+             name="cuda_add",
+            cpp_sources=cpp_source,
+            cuda_sources=cuda_source,
+            functions=["cuda_add_naive", "cuda_add_packed", 'cuda_add_coarsened'],
             #verbose=True,
-            with_cuda = True,
-            extra_cuda_cflags=["-O2"],
         )
+
 def cuda_add_naive(x : torch.Tensor,
              y : torch.Tensor):
-  return module_load.cuda_add_naive(x, y)
+  return module_inline.cuda_add_naive(x, y)
 def cuda_add_packed(x, y):
-  return module_load.cuda_add_packed(x, y)
+  return module_inline.cuda_add_packed(x, y)
 def cuda_add_coarsened(x, y):
-  return module_load.cuda_add_coarsened(x, y)
+  return module_inline.cuda_add_coarsened(x, y)
 
 def check():
   torch.manual_seed(0)
@@ -81,7 +151,7 @@ check()
     line_arg = 'provider',
     line_vals = ['triton', 'torch', 'cuda_naive', 'cuda_packed', 'cuda_coarsed'],
     line_names = ['Triton', 'Torch', 'Cuda_naive', 'Cuda_packed', 'Cuda_coarsed'],
-    styles = [('blue', '-'), ('green', '-'), ('red', '-'), ('red', '--'), ('red', ':')],
+    styles = [('blue', '-'), ('green', '-'), ('red', '-'), ('red', '--'), 'red', '*-'],
     ylabel = 'GB/s',
     plot_name = 'vector_add_perf',
     args = {},

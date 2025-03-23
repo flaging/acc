@@ -4,6 +4,28 @@
 #include <ATen/cudnn/Descriptors.h> // for TensorDescriptor
 #include <ATen/cudnn/Handle.h> // for getCudnnHandle
 
+#define CUDA_KERNEL_PROFILING(profile, kernel_call) \
+  if (profile) { \
+    do { \
+        cudaEvent_t start, end; \
+        cudaEventCreate(&start); \
+        cudaEventCreate(&end); \
+        cudaEventRecord(start); \
+        kernel_call; \
+        cudaEventRecord(end); \
+        cudaEventSynchronize(end); \
+        float time = 0.0; \
+        cudaEventElapsedTime(&time, start, end); \
+        cudaEventDestroy(start); \
+        cudaEventDestroy(end); \
+        float bandwidth_gbs = 3 * n_elements * sizeof(float) * 1e-9 / time / 1e-3; \
+        std::cout << "size = " << n_elements << "time = " << time \
+        << " ms and bandwidth = " << bandwidth_gbs << std::endl; \
+    } while (0); \
+  } else { \
+    do { kernel_call;} while (0); \
+  }
+
 template <typename T>
 __global__ void cuda_add_kernel(T* x_ptr, T* y_ptr, T* output_ptr, int n_elements) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -14,7 +36,8 @@ __global__ void cuda_add_kernel(T* x_ptr, T* y_ptr, T* output_ptr, int n_element
 
 #define FETCH_FLOAT4(pointer) (reinterpret_cast<float4*>(&(pointer))[0])
 template <typename T>
-__global__ void cuda_add_packed_kernel(T* x_ptr, T* y_ptr, T* output_ptr, int n_elements) {
+__global__ void cuda_add_packed_kernel(
+    T* x_ptr, T* y_ptr, T* output_ptr, int n_elements) {
   int idx = (blockIdx.x * blockDim.x + threadIdx.x) * 4;
   if (idx < n_elements) {
     float4 x4 = FETCH_FLOAT4(x_ptr[idx]);
@@ -29,12 +52,12 @@ __global__ void cuda_add_packed_kernel(T* x_ptr, T* y_ptr, T* output_ptr, int n_
 }
 
 template <typename T>
-__global__ void cuda_add_coarsened_kernel(T* x_ptr, T* y_ptr, T* output_ptr, int n_elements, int BLOCK_SIZE, int factor) {
+__global__ void cuda_add_coarsened_kernel(T* x_ptr,
+    T* y_ptr, T* output_ptr, int n_elements, int BLOCK_SIZE, int factor) {
   int idx = (blockIdx.x * blockDim.x + threadIdx.x) * factor;
-  if (idx + factor * BLOCK_SIZE < n_elements) {
-    for(int i= 0; i < factor * BLOCK_SIZE; i += BLOCK_SIZE) {
-      output_ptr[idx + i] = x_ptr[idx+i] + y_ptr[idx + i];
-    }
+  for(int i= 0; i < factor; i++) {
+    if (idx + i < n_elements)
+      output_ptr[idx + i] = x_ptr[idx + i] + y_ptr[idx + i];
   }
 }
 
@@ -43,7 +66,12 @@ torch::Tensor cuda_add_naive(torch::Tensor x, torch::Tensor y) {
   torch::Tensor output = torch::zeros_like(x);
   int n_elements = x.numel();
   int grid_size = (n_elements + BLOCK_SIZE -1) / BLOCK_SIZE;
-  cuda_add_kernel<float><<<grid_size, BLOCK_SIZE>>>(x.data_ptr<float>(), y.data_ptr<float>(), output.data_ptr<float>(), n_elements);
+  CUDA_KERNEL_PROFILING(false, 
+    (cuda_add_kernel<float><<<grid_size, BLOCK_SIZE>>>(
+        x.data_ptr<float>(),
+        y.data_ptr<float>(),
+        output.data_ptr<float>(),
+        n_elements)));
   return output;
 }
 
@@ -52,7 +80,8 @@ torch::Tensor cuda_add_packed(torch::Tensor x, torch::Tensor y) {
   torch::Tensor output = torch::zeros_like(x);
   int n_elements = x.numel();
   int grid_size = (n_elements + BLOCK_SIZE * 4 -1) / BLOCK_SIZE / 4;
-  cuda_add_packed_kernel<float><<<grid_size, BLOCK_SIZE>>>(x.data_ptr<float>(), y.data_ptr<float>(), output.data_ptr<float>(), n_elements);
+  cuda_add_packed_kernel<float><<<grid_size, BLOCK_SIZE>>>(
+    x.data_ptr<float>(), y.data_ptr<float>(), output.data_ptr<float>(), n_elements);
   return output;
 }
 
@@ -60,9 +89,13 @@ torch::Tensor cuda_add_coarsened(torch::Tensor x, torch::Tensor y) {
   const int BLOCK_SIZE = 1024;
   torch::Tensor output = torch::zeros_like(x);
   int n_elements = x.numel();
-  int factor = 8;
+  int factor = 4;
   int grid_size = (n_elements + BLOCK_SIZE * factor -1) / BLOCK_SIZE / factor;
-  cuda_add_coarsened_kernel<float><<<grid_size, BLOCK_SIZE>>>(x.data_ptr<float>(), y.data_ptr<float>(), output.data_ptr<float>(), n_elements, BLOCK_SIZE, factor);
+  cuda_add_coarsened_kernel<float><<<grid_size, BLOCK_SIZE>>>(
+    x.data_ptr<float>(),
+    y.data_ptr<float>(),
+    output.data_ptr<float>(),
+    n_elements, BLOCK_SIZE, factor);
   return output;
 }
 
